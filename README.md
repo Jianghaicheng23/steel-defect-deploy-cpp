@@ -156,7 +156,6 @@ cmake --build build -j$(nproc)
 
 ## 6. 多后端对比（ORT vs MNN FP32 vs MNN FP16）与内存安全体检
 
-## （ORT vs MNN FP32 vs MNN FP16）与内存安全体检
 
 ### 1. 360 张 NEU-DET 全量多后端对标（`--threads 2 --use-v5-class-thresh --save-images 0`）
 
