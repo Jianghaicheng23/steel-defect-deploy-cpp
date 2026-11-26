@@ -1,0 +1,14 @@
+build/
+output/
+data/neu_det_sample60/
+*.o
+*.a
+*.so
+*.onnx
+*.mnn
+*.csv
+.vscode/
+*:Zone.Identifier
+build_debug/
+third_party/
+__pycache__/
