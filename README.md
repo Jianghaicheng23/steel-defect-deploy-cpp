@@ -78,7 +78,12 @@ cmake --build build_debug -j$(nproc)
 
 ### 启用 MNN 后端编译（接入 `best_se.mnn` / `best_se_sim_fp32.mnn` 后）
 ```bash
+# x86_64 同时启用 ORT + MNN
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DENABLE_MNN=ON -DMNN_ROOT=/path/to/MNN
+cmake --build build -j$(nproc)
+
+# 树莓派 ARM64 端侧（仅启用 MNN，免装 ONNX Runtime）
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DENABLE_ORT=OFF -DENABLE_MNN=ON -DMNN_ROOT=/path/to/MNN
 cmake --build build -j$(nproc)
 ```
 
@@ -167,10 +172,30 @@ cmake --build build -j$(nproc)
 
 > **工程归因**：
 > 1. **MNN FP32 与 ORT FP32 798/798 完全一致**，验证了多后端接口解耦与 `MNN::Tensor::CAFFE` 数据排布零误差。
-> 2. **x86_64 下 FP16 反而慢于 FP32**：MNN 运行日志显示 `fp16:0`（x86 CPU 无原生 FP16 硬件指令集），开启 `Precision_Low` 触发额外反量化转换开销；FP16 带宽减半收益需在 ARM/NPU 端侧体现。
+> 2. **x86_64 下 FP16 反而慢于 FP32**：MNN 运行日志显示 `fp16:0`（x86 CPU 无原生 FP16 硬件指令集），开启 `Precision_Low` 触发额外反量化转换开销；FP16 算力加速收益需在支持 ARMv8.2 FP16/NPU 的端侧芯片体现。
 > 3. **FP16 掉框定位**：缺失的 12 框集中在 `crazing`(-6)、`patches`(-4，阈值 0.85)、`scratches`(-2，阈值 0.80)，因 FP16 10-bit 尾数在高置信度阈值边缘产生轻微舍入导致跌破阈值。
 
 ### 2. Valgrind 内存零泄漏体检（Debug `-g` 构建）
 - `steel_tests`（6/6 单元测试）：`definitely lost: 0 bytes`, `indirectly lost: 0 bytes`, `ERROR SUMMARY: 0 errors`
 - `ort_v5lite`（3 线程异步流水线）：`definitely lost: 0 bytes`, `indirectly lost: 0 bytes`
 - `mnn`（3 线程异步流水线）：`definitely lost: 0 bytes`, `indirectly lost: 0 bytes`
+
+---
+
+## 7. 树莓派 4B（ARM64）真机端侧实测
+
+- **真机环境**：Raspberry Pi 4B（4 核 Cortex-A72，600–1800 MHz，4 GB RAM，基准前待机 `39.9°C`，`throttled=0x0`），Debian 13 `aarch64`（`Linux 6.18.34+rpt-rpi-v8`，GLIBC 2.41，`g++ 14.2.0`）
+- **构建与验证**：CMake Release（`-DENABLE_ORT=OFF -DENABLE_MNN=ON`）链接 ARM64 预编译 MNN 2.7.0（`libMNN.so`），`ctest` **6/6 PASS**
+- **测试数据集**：360 张完整 NEU-DET 验证集（`--backend mnn --mode compare --use-v5-class-thresh --save-images 0`）
+
+| 模型（体积） | `--threads` | Sync 吞吐 / 耗时 | 3-Thread Async 吞吐 / 耗时 | 异步加速比 | Sync 分段耗时（read / prep / infer / post） | 检出框数 & 一致性 |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: |
+| MNN FP16 (`best_se.mnn`, 3 MB) | 2 | 14.60 FPS (24.66 s) | 15.01 FPS (23.99 s) | 1.03× | 0.79 / 1.40 / 66.14 / 0.17 ms | 784（`PASS`） |
+| MNN FP16 (`best_se.mnn`, 3 MB) | 4 | 20.56 FPS (17.51 s) | **20.85 FPS** (17.27 s) | 1.01× | 0.78 / 1.40 / 46.27 / 0.17 ms | 784（`PASS`） |
+| MNN FP32 (`best_se_sim_fp32.mnn`, 6 MB) | 2 | 14.66 FPS (24.55 s) | 15.09 FPS (23.86 s) | 1.03× | 0.77 / 1.40 / 65.84 / 0.17 ms | 791（`PASS`） |
+| MNN FP32 (`best_se_sim_fp32.mnn`, 6 MB) | 4 | 20.48 FPS (17.58 s) | **20.85 FPS** (17.26 s) | 1.02× | 0.78 / 1.41 / 46.47 / 0.17 ms | 791（`PASS`） |
+
+> **端侧工程归因**：
+> 1. **端到端性能跃升（13~14 FPS → 20.85 FPS，+50%+）**：C++17 Release + MNN 4 线程异步下纯推理耗时降至 `46.27 ms`，手写后处理仅 `0.17 ms`，Sync 与 Async 检出框 **100% 一致（PASS）**；连续 3 轮 FP16 `--threads 2` 异步吞吐稳定在 `14.87 → 15.00 → 15.07 FPS`。
+> 2. **ARMv8.0-A 无原生 FP16 SIMD 导致同速但体积减半**：MNN 日志显示 `i8sdot:0, fp16:0, i8mm: 0`，Cortex-A72 需在运行期反量化为 FP32 执行 NEON 计算，因此 FP16 与 FP32 同为 `20.85 FPS`；但 FP16 成功将模型体积减半（`6 MB → 3 MB`），且与 FP32 检出吻合度达 **99.1%**（784 vs 791）。
+> 3. **计算密集占比与轻微线程超配（Oversubscription）**：`--save-images 0` 场景下推理占单帧总耗时 95%+；`--threads 2` 异步取得 `1.03×`（贴近阿姆达尔定律理论上限 `1.036×`），而 `--threads 4` 异步为 `1.01×~1.02×`（理论上限 `1.05×`），因 4 个 MNN 工作线程与前/后处理线程在 4 物理核上出现轻微 CPU 争用（Async 下 `prep` 由 `1.40 ms` 升至 `~2.55 ms`）。
